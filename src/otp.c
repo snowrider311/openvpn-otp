@@ -2,10 +2,13 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <time.h>
 #include <endian.h>
 #include <string.h>
 #include <ctype.h>
 #include <inttypes.h>
+#include <errno.h>
+#include <json-c/json.h>
 
 #ifndef htobe64
 #include <netinet/in.h>
@@ -26,6 +29,16 @@
 #define MAXWORDLEN 256
 
 #include "openvpn-cr.h"
+
+
+int record_successful_totp_event(const char *userId, const char *ip);
+int is_new_totp_required(const char *userId, const char *ip);
+
+
+static char *aws_credentials_file = "undefined";
+static char *aws_region = "undefined";
+static char *aws_dynamodb_table_name = "undefined";
+static int otp_expiration_seconds = 60*60*24;
 
 static char *otp_secrets = "/etc/ppp/otp-secrets";
 static char *hotp_counters = "/var/spool/openvpn/hotp-counters/";
@@ -565,6 +578,52 @@ static const char * get_env (const char *name, const char *envp[])
 }
 
 
+/*
+ * Given an environment variable name, search the envp array for its value. If found, a string copy of that
+ * value will be returned. Otherwise, a copy of default_value will be returned.
+ *
+ * This way, the caller is always responsible for freeing the memory allocated for the returned string.
+ *
+ * The final value of the environment variable is always logged.
+ */
+char *alloc_string_from_env(const char *envp[], const char *name, char *default_value) {
+    const char *str_val = get_env(name, envp);
+    char *rv = strdup(str_val ? str_val : default_value);
+    LOG("OTP-AUTH: alloc_string_from_env: %s=%s\n", name, rv);
+    return rv;
+}
+
+
+/*
+ * Given an environment variable name, search the envp array for its value. If found, the value will be
+ * converted to an int (if possible) and it will be returned. Otherwise, this is a no-op. In any case,
+ * the value of the environment variable is logged, along with any conversion errors that might happen.
+ */
+int get_int_from_env(const char *envp[], const char *name, int default_value) {
+    int rv = default_value;
+
+    const char *in_str = get_env(name, envp);
+    if (in_str) {
+        char *end;
+        
+        errno = 0;
+        
+        long lnum = strtol(in_str, &end, 10);
+        if (end == in_str) {
+            LOG("OTP-AUTH: maybe_store_converted_int: Error: Can't convert '%s' to number\n", in_str);
+        } else if ((lnum == LONG_MAX || lnum == LONG_MIN) && errno == ERANGE) {
+            LOG("OTP-AUTH: maybe_store_converted_int: Error: Number '%s' out of range\n", in_str);
+        } else if ((lnum > INT_MAX) || (lnum < INT_MIN)) {
+            LOG("OTP-AUTH: maybe_store_converted_int: Error: Number '%s' out of range\n", in_str);
+        } else {
+            rv = (int) lnum;
+        }
+    }
+
+    LOG("OTP-AUTH: get_int_from_env: %s=%ld\n", name, rv);
+    return rv;
+}
+
 
 /**
  * Plugin open (init)
@@ -581,70 +640,26 @@ openvpn_plugin_open_v1 (unsigned int *type_mask, const char *argv[], const char 
   *type_mask = OPENVPN_PLUGIN_MASK (OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY);
 
 
-  /*
-   * Set up configuration variables
-   *
-   */
-  const char * cfg_otp_secrets = get_env("otp_secrets", argv);
-  if (cfg_otp_secrets != NULL) {
-     otp_secrets = strdup(cfg_otp_secrets);
-  }
-  LOG("OTP-AUTH: otp_secrets=%s\n", otp_secrets);
+  /* Set up configuration variables */
+    
+  aws_credentials_file = alloc_string_from_env(argv, "aws_credentials_file", aws_credentials_file);
+  aws_region = alloc_string_from_env(argv, "aws_region", aws_region);
+  aws_dynamodb_table_name = alloc_string_from_env(argv, "aws_dynamodb_table_name", aws_dynamodb_table_name);
+  otp_expiration_seconds = get_int_from_env(argv, "otp_expiration_seconds", otp_expiration_seconds);
 
-  const char * cfg_hotp_counter_file = get_env("hotp_counters", argv);
-  if (cfg_hotp_counter_file != NULL) {
-     hotp_counters = strdup(cfg_hotp_counter_file);
-  }
-  LOG("OTP-AUTH: hotp_counters=%s\n", hotp_counters);
+  otp_secrets = alloc_string_from_env(argv, "otp_secrets", otp_secrets);
+  hotp_counters = alloc_string_from_env(argv, "hotp_counters", hotp_counters);
 
-  const char * cfg_otp_slop = get_env("otp_slop", argv);
-  if (cfg_otp_slop != NULL) {
-     otp_slop = atoi(cfg_otp_slop);
-  }
-  LOG("OTP-AUTH: otp_slop=%i\n", otp_slop);
+  otp_slop = get_int_from_env(argv, "otp_slop", otp_slop);
+  totp_t0 = get_int_from_env(argv, "totp_t0", totp_t0);
+  totp_step = get_int_from_env(argv, "totp_step", totp_step);
+  totp_digits = get_int_from_env(argv, "totp_digits", totp_digits);
+  motp_step = get_int_from_env(argv, "motp_step", motp_step);
+  hotp_syncwindow = get_int_from_env(argv, "hotp_syncwindow", hotp_syncwindow);
+  password_is_cr = get_int_from_env(argv, "password_is_cr", password_is_cr);
+  debug = get_int_from_env(argv, "debug", debug);
 
-  const char * cfg_totp_t0 = get_env("totp_t0", argv);
-  if (cfg_totp_t0 != NULL) {
-     totp_t0 = atoi(cfg_totp_t0);
-  }
-  LOG("OTP-AUTH: totp_t0=%i\n", totp_t0);
-
-  const char * cfg_totp_step= get_env("totp_step", argv);
-  if (cfg_totp_step != NULL) {
-     totp_step = atoi(cfg_totp_step);
-  }
-  LOG("OTP-AUTH: totp_step=%i\n", totp_step);
-
-  const char * cfg_totp_digits = get_env("totp_digits", argv);
-  if (cfg_totp_digits != NULL) {
-     totp_digits = atoi(cfg_totp_digits);
-  }
-  LOG("OTP-AUTH: totp_digits=%i\n", totp_digits);
-
-  const char * cfg_motp_step = get_env("motp_step", argv);
-  if (cfg_motp_step != NULL) {
-     motp_step = atoi(cfg_motp_step);
-  }
-  LOG("OTP-AUTH: motp_step=%i\n", motp_step);
-
-  const char * cfg_hotp_syncwindow = get_env("hotp_syncwindow", argv);
-  if (cfg_hotp_syncwindow != NULL) {
-     hotp_syncwindow = atoi(cfg_hotp_syncwindow);
-  }
-  LOG("OTP-AUTH: hotp_syncwindow=%i\n", hotp_syncwindow);
-
-  const char * cfg_password_cr = get_env("password_is_cr", argv);
-  if (cfg_password_cr != NULL) {
-	  password_is_cr = atoi(cfg_password_cr);
-  }
-  LOG("OTP-AUTH: password_is_cr=%i\n", password_is_cr);
-
-  const char * cfg_debug = get_env("debug", argv);
-  if (cfg_debug != NULL) {
-       debug = atoi(cfg_debug);
-  }
-  LOG("OTP-AUTH: debug=%i\n", debug);
-  DEBUG("OTP_AUTH: debug mode has been enabled\n");
+  if (debug) DEBUG("OTP_AUTH: debug mode has been enabled\n");
 
   return (openvpn_plugin_handle_t) otp_secrets;
 }
@@ -682,20 +697,199 @@ openvpn_plugin_func_v1 (openvpn_plugin_handle_t handle, const int type, const ch
   else {
 	  otp_password = password;
   }
-   
-  /* check entered username/password against what we require */
+
+  int new_totp_required = is_new_totp_required(username, ip);
+  LOG("OTP-AUTH: New TOTP required for remote [%s:%s]? %d\n", username, ip, new_totp_required);
+
+  /* check entered username/TOTP against what we require */
   int ok = otp_verify(username, otp_password);
 
-  if (ok == 1) {
-    LOG("OTP-AUTH: authentication succeeded for username '%s', remote %s:%s\n", username, ip, port);
+  if (ok == 1 || (strlen(otp_password) == 0 && new_totp_required == 0)) {
+    if (ok == 1) {
+        /* User may have entered a valid TOTP, even if not required. If so, let's record that event anyway
+         * and reset the clock. */
+        LOG("OTP-AUTH: authentication succeeded for username '%s', remote [%s:%s]\n", username, ip, port);
+        record_successful_totp_event(username, ip);
+    }
     return OPENVPN_PLUGIN_FUNC_SUCCESS;
   }
   else {
-    LOG("OTP-AUTH: authentication failed for username '%s', remote %s:%s\n", username, ip, port);
+    LOG("OTP-AUTH: authentication failed for username '%s', remote [%s:%s]\n", username, ip, port);
     return OPENVPN_PLUGIN_FUNC_ERROR;
   }
 }
 
+
+/*
+ * Reads the contents of a file into a string, which the caller is then responsible for freeing.
+ */
+char *read_file_contents(FILE *fp) {
+    const int bufSize = 256;
+    char buf[bufSize];
+    
+    char *str = NULL;
+    char *temp = NULL;
+    unsigned int size = 1;  // start with size of 1 to make room for null terminator
+    unsigned int strlength;
+    
+    while (fgets(buf, sizeof(buf), fp) != NULL) {
+        strlength = strlen(buf);
+        temp = realloc(str, size + strlength);  // allocate room for the buf that gets appended
+        if (temp == NULL) {
+            // allocation error
+        } else {
+            str = temp;
+        }
+        strcpy(str + size - 1, buf);     // append buffer to str
+        size += strlength;
+    }
+    
+    return str;
+}
+
+
+/**
+ * Records a successful TOTP login event in AWS DynamoDB. Returns 0 if this was successful, -1 if not.
+ */
+int record_successful_totp_event(const char *userId, const char *ip) {
+    const char *cmdTemplate = "AWS_SHARED_CREDENTIALS_FILE='%s' aws dynamodb put-item --region=%s --table-name %s --item '%s'";
+    
+    time_t rawtime = time(NULL);
+    char rawtime_str[32];
+    sprintf(rawtime_str, "%ld", rawtime);
+
+    struct json_object *rootJ = json_object_new_object();
+    
+    struct json_object *userIdJ = json_object_new_object();
+    json_object_object_add(userIdJ, "S", json_object_new_string(userId));
+
+    struct json_object *ipAddressJ = json_object_new_object();
+    json_object_object_add(ipAddressJ, "S", json_object_new_string(ip));
+
+    struct json_object *lastLoginJ = json_object_new_object();
+    json_object_object_add(lastLoginJ, "N", json_object_new_string(rawtime_str));
+
+    json_object_object_add(rootJ, "userId", userIdJ);
+    json_object_object_add(rootJ, "ipAddress", ipAddressJ);
+    json_object_object_add(rootJ, "lastLogin", lastLoginJ);
+    
+    const char *json_rep = json_object_to_json_string(rootJ);
+    DEBUG("OTP-AUTH: record_successful_totp_event: JSON object: %s\n", json_rep);
+    
+    const int bufSize = 1024;
+    char buf[bufSize];
+    sprintf(buf, cmdTemplate, aws_credentials_file, aws_region, aws_dynamodb_table_name, json_rep);
+    LOG("OTP-AUTH: record_successful_totp_event: Command: %s\n", buf);
+
+    json_object_put(rootJ); // Delete the json object
+    
+    FILE *fp;
+    if ((fp = popen(buf, "r")) == NULL) {
+        LOG("OTP-AUTH: record_successful_totp_event: Error opening pipe!\n");
+        return -1;
+    }
+    
+    char *str = read_file_contents(fp);
+    LOG("OTP-AUTH: record_successful_totp_event: Command OUTPUT: %s\n", str);
+    free(str);
+    
+    if (pclose(fp)) {
+        LOG("OTP-AUTH: record_successful_totp_event: Error: Command not found or exited with error status\n");
+        LOG("OTP-AUTH: Failed to record TOTP success event\n");
+        return -1;
+    }
+    
+    return 0;
+}
+
+
+/*
+ * Given a JSON string (generally returned from a call to Amazon DynamoDB), parse it and determine if too much time
+ * has passed since the user last submitted a valid TOTP token. Return 1 if that's the case, 0 if not, and
+ * -1 in the error case.
+ */
+int has_too_much_time_elapsed(const char *str) {
+    int64_t last_login_time = 0;
+    time_t rawtime = time(NULL);
+    
+    if (!str || !strlen(str)) return -1;
+    struct json_object *jobj = json_tokener_parse(str);
+    if (!jobj) return -1;
+    
+    struct json_object *target1 = NULL;
+    struct json_object *target2 = NULL;
+    struct json_object *target3 = NULL;
+    
+    if (json_object_object_get_ex(jobj, "Item", &target1)) {
+        if (json_object_object_get_ex(target1, "lastLogin", &target2)) {
+            if (json_object_object_get_ex(target2, "N", &target3)) {
+                last_login_time = json_object_get_int64(target3);
+                LOG("OTP-AUTH: has_too_much_time_elapsed: Last login: %ld. Current time: %ld. Diff: %ld, Max-Allowed-Diff: %ld\n",
+                    last_login_time, rawtime, rawtime-last_login_time, otp_expiration_seconds);
+            }
+        }
+    }
+    
+    if (!last_login_time) {
+        LOG("OTP-AUTH: has_too_much_time_elapsed: No previous login record found.");
+    }
+    
+    /* release memory used for JSON objects */
+    json_object_put(jobj);
+    json_object_put(target1);
+    json_object_put(target2);
+    json_object_put(target3);
+    
+    return rawtime - last_login_time > otp_expiration_seconds;
+}
+
+
+/*
+ * Determine if too much time has elapsed since the user last entered a valid TOTP. Return 1 if so,
+ * -1 on an error condition, and 0 otherwise (i.e. user doesn't need to enter a new TOTP).
+ */
+int is_new_totp_required(const char *userId, const char *ip) {
+    const char *cmdTemplate = "AWS_SHARED_CREDENTIALS_FILE=%s aws dynamodb --region=%s get-item --table-name %s --key '%s'";
+    
+    struct json_object *rootJ = json_object_new_object();
+    
+    struct json_object *userIdJ = json_object_new_object();
+    json_object_object_add(userIdJ, "S", json_object_new_string(userId));
+    
+    struct json_object *ipAddressJ = json_object_new_object();
+    json_object_object_add(ipAddressJ, "S", json_object_new_string(ip));
+    
+    json_object_object_add(rootJ, "userId", userIdJ);
+    json_object_object_add(rootJ, "ipAddress", ipAddressJ);
+
+    const char *json_rep = json_object_to_json_string(rootJ);
+    DEBUG("OTP-AUTH: is_new_totp_required: JSON object: %s\n", json_rep);
+    
+    const int bufSize = 1024;
+    char buf[bufSize];
+    sprintf(buf, cmdTemplate, aws_credentials_file, aws_region, aws_dynamodb_table_name, json_rep);
+    LOG("OTP-AUTH: is_new_totp_required: Command: %s\n", buf);
+
+    json_object_put(rootJ); /* Free JSON object */
+
+    FILE *fp;
+    if ((fp = popen(buf, "r")) == NULL) {
+        LOG("OTP-AUTH: is_new_totp_required: Error opening pipe!\n");
+        return -1;
+    }
+    
+    char *str = read_file_contents(fp);
+    DEBUG("OTP-AUTH: is_new_totp_required: Command OUTPUT: %s\n", str);
+    int rv = has_too_much_time_elapsed(str);
+    free(str);
+    
+    if (pclose(fp)) {
+        LOG("OTP-AUTH: is_new_totp_required: Error: Command not found or exited with error status\n");
+        return -1;
+    }
+    
+    return rv;
+}
 
 
 /**

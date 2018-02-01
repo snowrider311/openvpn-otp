@@ -12,6 +12,7 @@ MAINTAINERCLEANFILES = Makefile.in \
                        libtool \
                        m4/*.m4
 
+AM_LDFLAGS = -ljson-c
 AUTOMAKE_OPTIONS = foreign
 ACLOCAL_AMFLAGS = -I m4
 SUBDIRS = src

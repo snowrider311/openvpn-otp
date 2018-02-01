@@ -14,7 +14,11 @@ AC_PROG_CXX
 # Checks for libraries.
 AC_CHECK_LIB([crypto], [HMAC_CTX_init], [], [AC_MSG_ERROR([OpenSSL libraries required])])
 
+AC_SEARCH_LIBS([json_object_get], [json-c json], [HAVE_JSON=yes], [], [])
+
 # Checks for header files.
+AC_CHECK_HEADERS([json-c/json.h], [],
+        [AC_MSG_ERROR([Missing JSON headers])])
 AC_CHECK_HEADERS([inttypes.h netinet/in.h stdint.h string.h], [],
 	[AC_MSG_ERROR([Missing system headers])]   )
 AC_CHECK_HEADERS([openssl/evp.h openssl/hmac.h], [],

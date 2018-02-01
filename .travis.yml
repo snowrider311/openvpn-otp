@@ -6,6 +6,8 @@ env:
 branches:
   only:
     - master
+    - 24hour
+
 
 services:
   - docker
@@ -44,3 +46,4 @@ deploy:
   skip_cleanup: true
   on:
     branch: master
+    branch: 24hour

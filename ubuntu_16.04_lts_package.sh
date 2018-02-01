@@ -9,4 +9,5 @@ mkdir -p /tmp/openvpn-otp-build/usr/lib/openvpn
 cp /usr/lib/openvpn/openvpn-otp.* /tmp/openvpn-otp-build/usr/lib/openvpn
 
 fpm -s dir -C /tmp/openvpn-otp-build -t deb --name openvpn-otp-snowrider311 \
-  --version $PACKAGE_VERSION --iteration $ITERATION --depends openvpn
+  --version $PACKAGE_VERSION --iteration $ITERATION \
+  --depends openvpn --depends libjson0 --depends awscli

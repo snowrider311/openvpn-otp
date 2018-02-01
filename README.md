@@ -1,4 +1,4 @@
-Travis build status: [![Build Status](https://travis-ci.org/snowrider311/openvpn-otp.svg?branch=master)](https://travis-ci.org/snowrider311/openvpn-otp)
+Travis build status: [![Build Status](https://travis-ci.org/snowrider311/openvpn-otp.svg?branch=24hour)](https://travis-ci.org/snowrider311/openvpn-otp)
 
 The latest Ubuntu 16.04 Debian package (built by Travis) can be found [here](https://github.com/snowrider311/openvpn-otp/releases/latest).
 
